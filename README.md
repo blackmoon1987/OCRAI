@@ -27,11 +27,12 @@ python main.py --mode [train/predict] --language [language_code] --image_path [p
 
 
 Example:
+
 python main.py --mode train --language [language_code] --image_folder [path_to_training_images] --epochs [number_of_epochs] --batch_size [batch_size]
 
 OR
 
-python main.py --mode predict --language en --image_path test_image.jpg
+python main.py --mode predict --language en,ar --image_path test1_image.jpg
 
 ## Features
 

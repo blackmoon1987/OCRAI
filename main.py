@@ -2,8 +2,6 @@ import os
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from typing import Dict, List
 import argparse
 import cv2
 
@@ -15,7 +13,7 @@ class OCRModel:
         self.img_height = 64
         self.img_width = 256
 
-    def get_char_list(self, language: str) -> List[str]:
+    def get_char_list(self, language: str) -> list:
         language = language.lower()
         char_lists = {
             'en': list('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'),
@@ -45,52 +43,120 @@ class OCRModel:
 
     def create_crnn_model(self):
         inputs = layers.Input(shape=(self.img_height, self.img_width, 3))
-        x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(inputs)
+        x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
+        x = layers.BatchNormalization()(x)
         x = layers.MaxPooling2D((2, 2))(x)
-        x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Dropout(0.25)(x)
+        
         x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Dropout(0.25)(x)
+        
+        x = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling2D((2, 2))(x)
+        x = layers.Dropout(0.25)(x)
+        
         x = layers.Reshape((-1, x.shape[-1]))(x)
-        x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
-        x = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(x)
+        
+        x = layers.Bidirectional(layers.LSTM(256, return_sequences=True, dropout=0.2))(x)
+        x = layers.Bidirectional(layers.LSTM(128, return_sequences=True, dropout=0.2))(x)
+        
+        attention = layers.Dense(1, activation='tanh')(x)
+        attention = layers.Flatten()(attention)
+        attention = layers.Activation('softmax')(attention)
+        attention = layers.RepeatVector(128)(attention)
+        attention = layers.Permute([2, 1])(attention)
+        
+        x = layers.multiply([x, attention])
+        
         outputs = layers.Dense(len(self.char_list) + 1, activation='softmax')(x)
         model = models.Model(inputs=inputs, outputs=outputs)
         return model
+
 
     def ctc_lambda_func(self, args):
         y_pred, labels, input_length, label_length = args
         return tf.keras.backend.ctc_batch_cost(labels, y_pred, input_length, label_length)
 
+    def load_image_and_label(self, image_folder: str, image_name: str):
+        image_path = os.path.join(image_folder, f"{image_name}.png")
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Cannot read image {image_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (self.img_width, self.img_height))
+        img = img.astype(np.float32) / 255.0
+        label_path = os.path.join(image_folder, f"{image_name}.txt")
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f"Label file {label_path} does not exist")
+        with open(label_path, 'r', encoding='utf-8') as f:
+            label = f.readline().strip()
+        return img, label
+
+    def encode_label(self, label: str):
+        encoded_label = [self.char_list.index(c) for c in label if c in self.char_list]
+        return np.array(encoded_label)
+
+    def data_generator_split(self, image_folder: str, split_file: str, batch_size: int):
+        with open(os.path.join(image_folder, split_file), 'r', encoding='utf-8') as f:
+            image_names = [line.strip() for line in f.readlines()]
+
+        while True:
+            np.random.shuffle(image_names)
+            for i in range(0, len(image_names), batch_size):
+                batch_images = []
+                batch_labels = []
+                batch_image_names = image_names[i:i + batch_size]
+                for image_name in batch_image_names:
+                    try:
+                        img, label = self.load_image_and_label(image_folder, image_name)
+                        batch_images.append(img)
+                        batch_labels.append(self.encode_label(label))
+                    except Exception as e:
+                        print(f"Error loading {image_name}: {e}")
+                        continue
+                if not batch_images:
+                    continue
+                label_length = np.array([len(label) for label in batch_labels])
+                max_label_length = max(label_length)
+                padded_labels = np.ones((len(batch_labels), max_label_length)) * -1
+                for j, label in enumerate(batch_labels):
+                    padded_labels[j, :len(label)] = label
+                images = np.array(batch_images)
+                input_length = np.ones((len(images), 1)) * (self.img_width // 4)
+                label_length = label_length.reshape(-1, 1)
+                yield [images, padded_labels, input_length, label_length], np.zeros(len(images))
+
     def train(self, image_folder: str, epochs: int = 50, batch_size: int = 32, continue_training: bool = False):
         print(f"Training model for {self.language}...")
-        train_datagen = ImageDataGenerator(
-            rescale=1./255,
-            rotation_range=15,
-            width_shift_range=0.2,
-            height_shift_range=0.2,
-            shear_range=0.2,
-            zoom_range=0.2,
-            fill_mode='nearest',
-            validation_split=0.2
-        )
-        train_generator = train_datagen.flow_from_directory(
-            image_folder,
-            target_size=(self.img_height, self.img_width),
-            batch_size=batch_size,
-            class_mode='sparse',
-            subset='training'
-        )
-        validation_generator = train_datagen.flow_from_directory(
-            image_folder,
-            target_size=(self.img_height, self.img_width),
-            batch_size=batch_size,
-            class_mode='sparse',
-            subset='validation'
-        )
+        image_names = [os.path.splitext(f)[0] for f in os.listdir(image_folder) if f.endswith(".png")]
+        np.random.shuffle(image_names)
+        split_index = int(0.8 * len(image_names))
+        train_image_names = image_names[:split_index]
+        val_image_names = image_names[split_index:]
+
+        def save_split(image_names, split_type):
+            split_file = os.path.join(image_folder, f'{split_type}_split.txt')
+            with open(split_file, 'w', encoding='utf-8') as f:
+                for name in image_names:
+                    f.write(f"{name}\n")
+
+        save_split(train_image_names, 'train')
+        save_split(val_image_names, 'val')
+
+        train_generator = self.data_generator_split(image_folder, 'train_split.txt', batch_size)
+        val_generator = self.data_generator_split(image_folder, 'val_split.txt', batch_size)
+
+        steps_per_epoch = len(train_image_names) // batch_size
+        validation_steps = len(val_image_names) // batch_size
+
         if continue_training and self.model is not None:
             print("Continuing training from the previous model...")
         else:
             self.model = self.create_crnn_model()
+
         labels = layers.Input(name='labels', shape=[None], dtype='float32')
         input_length = layers.Input(name='input_length', shape=[1], dtype='int64')
         label_length = layers.Input(name='label_length', shape=[1], dtype='int64')
@@ -98,23 +164,26 @@ class OCRModel:
             [self.model.output, labels, input_length, label_length])
         model = models.Model(inputs=[self.model.input, labels, input_length, label_length], outputs=loss_out)
         model.compile(loss={'ctc': lambda y_true, y_pred: y_pred}, optimizer='adam')
+
         if continue_training:
             model_path = f'ocr_model_{self.language}.h5'
             if os.path.exists(model_path):
                 self.model.load_weights(model_path)
                 print(f"Loaded weights from previous training for {self.language}")
+
         history = model.fit(
             train_generator,
-            steps_per_epoch=train_generator.samples // batch_size,
-            validation_data=validation_generator,
-            validation_steps=validation_generator.samples // batch_size,
+            steps_per_epoch=steps_per_epoch,
+            validation_data=val_generator,
+            validation_steps=validation_steps,
             epochs=epochs
         )
+
         self.model.save(f'ocr_model_{self.language}.h5')
         print(f"Model for {self.language} trained and saved.")
         return history
 
-    def load_model(self):
+    def load_model_file(self):
         model_path = f'ocr_model_{self.language}.h5'
         if os.path.exists(model_path):
             self.model = models.load_model(model_path, custom_objects={'ctc_lambda_func': self.ctc_lambda_func})
@@ -134,13 +203,13 @@ class OCRModel:
         results = tf.keras.backend.ctc_decode(pred, input_length=input_len, greedy=True)[0][0]
         output_text = []
         for result in results:
-            result = tf.strings.reduce_join(self.char_list[result]).numpy().decode('utf-8')
+            result = tf.strings.reduce_join([self.char_list[int(c)] for c in result if c != -1]).numpy().decode('utf-8')
             output_text.append(result)
         return output_text
 
     def extract_text(self, image_path: str) -> str:
         if self.model is None:
-            self.load_model()
+            self.load_model_file()
         if self.model is None:
             return f"No model available for {self.language}"
         preprocessed_image = self.preprocess_image(image_path)
@@ -150,7 +219,7 @@ class OCRModel:
 
 class MultilingualOCRSystem:
     def __init__(self):
-        self.models: Dict[str, OCRModel] = {}
+        self.models = {}
 
     def add_model(self, language: str):
         if language not in self.models:

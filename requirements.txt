@@ -1,0 +1,11 @@
+tensorflow
+keras
+numpy
+opencv-python
+Pillow
+scikit-image
+matplotlib
+pandas
+pytesseract
+python-Levenshtein
+tqdm
